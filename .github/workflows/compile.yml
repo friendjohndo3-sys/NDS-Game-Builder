@@ -1,290 +1,34 @@
-name: Nintendo DS and 3DS ZIP Builder
-
-on:
-  push:
-    paths:
-      - "uploads/*.zip"
-      - ".github/workflows/compile.yml"
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    container:
-      image: devkitpro/devkitarm:latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Configure devkitPro
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
-          export DEVKITARM="${DEVKITARM:-$DEVKITPRO/devkitARM}"
-          export PATH="$DEVKITARM/bin:$PATH"
-
-          echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
-          echo "DEVKITPRO=$DEVKITPRO" >> "$GITHUB_ENV"
-          echo "DEVKITARM=$DEVKITARM" >> "$GITHUB_ENV"
-
-          dkp-pacman -Sy --noconfirm
-          dkp-pacman -S --needed --noconfirm nds-dev 3ds-dev
-
-          command -v make
-          command -v arm-none-eabi-gcc
-          arm-none-eabi-gcc --version
-
-      - name: Locate uploaded ZIP
-        id: archive
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p uploads
-
-          mapfile -t archives < <(
-            find uploads -maxdepth 1 -type f -iname '*.zip' -print | sort
-          )
-
-          if [ "${#archives[@]}" -eq 0 ]; then
-            echo "::error::No ZIP found. Commit your project ZIP to uploads/."
-            exit 1
-          fi
-
-          archive="${archives[-1]}"
-          echo "path=$archive" >> "$GITHUB_OUTPUT"
-          echo "Using archive: $archive"
-
-      - name: Extract and inspect ZIP
-        id: inspect
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p /tmp/nintendo-project build-output
-
-          python3 - "${{ steps.archive.outputs.path }}" <<'PY'
-          import sys
-          import zipfile
-          from pathlib import PurePosixPath
-
-          archive = sys.argv[1]
-
-          with zipfile.ZipFile(archive) as z:
-              members = z.infolist()
-
-              if sum(m.file_size for m in members) > 1024**3:
-                  raise SystemExit("ZIP exceeds 1 GiB uncompressed limit.")
-
-              for member in members:
-                  name = member.filename.replace("\\", "/")
-                  path = PurePosixPath(name)
-
-                  if path.is_absolute() or ".." in path.parts:
-                      raise SystemExit(f"Unsafe ZIP path: {name}")
-
-                  if member.file_size > 200 * 1024**2:
-                      raise SystemExit(f"ZIP member too large: {name}")
-
-              z.extractall("/tmp/nintendo-project")
-
-          print("ZIP extracted successfully.")
-          PY
-
-          echo "Files discovered:"
-          find /tmp/nintendo-project -type f | head -300
-
-      - name: Detect project type
-        id: detect
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 <<'PY' >> "$GITHUB_OUTPUT"
-          from pathlib import Path
-
-          root = Path("/tmp/nintendo-project")
-          files = [p for p in root.rglob("*") if p.is_file()]
-
-          makefiles = [
-              p for p in files
-              if p.name.lower() in ("makefile", "gnumakefile")
-          ]
-
-          source = [
-              p for p in files
-              if p.suffix.lower() in (".c", ".cc", ".cpp", ".cxx", ".s")
-          ]
-
-          contents = "\n".join(
-              str(p).lower() + "\n" +
-              (p.read_text(errors="ignore")[:100000].lower()
-               if p.suffix.lower() in (".c", ".h", ".cpp", ".hpp",
-                                       ".cc", ".cxx", ".mk")
-               else "")
-              for p in files
-          )
-
-          ds = (
-              "libnds" in contents
-              or "#include <nds.h>" in contents
-              or "nds-examples" in contents
-          )
-
-          three_ds = (
-              "libctru" in contents
-              or "#include <3ds.h>" in contents
-              or "3ds-examples" in contents
-          )
-
-          if ds and three_ds:
-              target = "both"
-          elif ds:
-              target = "ds"
-          elif three_ds:
-              target = "3ds"
-          elif makefiles:
-              target = "existing"
-          elif source:
-              target = "unknown-source"
-          else:
-              target = "unsupported"
-
-          print(f"target={target}")
-          print(f"makefiles={len(makefiles)}")
-          print(f"sources={len(source)}")
-          PY
-
-          echo "Detected: ${{ steps.detect.outputs.target }}"
-
-      - name: Build Nintendo DS
-        if: steps.detect.outputs.target == 'ds'
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          export PATH="${DEVKITARM}/bin:$PATH"
-          cd /tmp/nintendo-project
-
-          if ! find . -type f -iname 'makefile' -print -quit | grep -q .; then
-            mkdir -p source
-
-            while IFS= read -r -d '' file; do
-              cp "$file" source/
-            done < <(
-              find . -maxdepth 1 -type f \
-                \( -name '*.c' -o -name '*.cpp' -o -name '*.h' \) \
-                -print0
-            )
-
-            curl -fsSL \
-              https://raw.githubusercontent.com/devkitPro/nds-examples/master/hello_world/Makefile \
-              -o Makefile
-          fi
-
-          make
-
-      - name: Build Nintendo 3DS
+      - name: Fix outdated 3DS Makefile paths
         if: steps.detect.outputs.target == '3ds'
         shell: bash
         run: |
-          set -euxo pipefail
-
-          export PATH="${DEVKITARM}/bin:$PATH"
-          cd /tmp/nintendo-project
-
-          if ! find . -type f -iname 'makefile' -print -quit | grep -q .; then
-            mkdir -p source
-
-            while IFS= read -r -d '' file; do
-              cp "$file" source/
-            done < <(
-              find . -maxdepth 1 -type f \
-                \( -name '*.c' -o -name '*.cpp' -o -name '*.h' \) \
-                -print0
-            )
-
-            curl -fsSL \
-              https://raw.githubusercontent.com/devkitPro/3ds-examples/master/templates/application/Makefile \
-              -o Makefile
-          fi
-
-          make
-
-      - name: Build existing configured project
-        if: steps.detect.outputs.target == 'existing'
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          cd /tmp/nintendo-project
-
-          mapfile -t makefiles < <(
-            find . -type f \
-              \( -name Makefile -o -name makefile \) \
-              -not -path '*/.git/*' | sort
-          )
-
-          if [ "${#makefiles[@]}" -eq 1 ]; then
-            directory="$(dirname "${makefiles[0]}")"
-            cd "$directory"
-            make
-          else
-            echo "::error::Multiple Makefiles found. The project needs target-specific build selection."
-            printf '%s\n' "${makefiles[@]}"
-            exit 1
-          fi
-
-      - name: Explain unsupported project
-        if: steps.detect.outputs.target == 'unknown-source' || steps.detect.outputs.target == 'unsupported'
-        shell: bash
-        run: |
-          echo "::error::Could not identify the platform or a supported build configuration."
-          echo "Include a working project Makefile or recognizable DS/3DS APIs."
-          exit 1
-
-      - name: Collect compiled files
-        shell: bash
-        run: |
           set -euo pipefail
 
-          find /tmp/nintendo-project -type f \
-            \( -iname '*.nds' -o -iname '*.3dsx' \
-               -o -iname '*.cia' -o -iname '*.elf' \
-               -o -iname '*.smdh' \) \
-            -not -path '*/.git/*' \
-            -exec cp -n {} build-output/ \;
+          cd /tmp/nintendo-project
 
-          if [ -z "$(find build-output -type f -print -quit)" ]; then
-            echo "::error::No compiled Nintendo binaries were produced."
-            exit 1
-          fi
+          echo "Searching Makefiles for outdated devkitPro paths..."
 
-          {
-            echo "Nintendo build report"
-            echo
-            echo "Detected target: ${{ steps.detect.outputs.target }}"
-            echo
-            find build-output -maxdepth 1 -type f -printf '%f (%s bytes)\n'
-          } > build-output/BUILD-REPORT.txt
+          while IFS= read -r -d '' file; do
+            if grep -qF '/opt/devkitpro/libctru/base_tools' "$file"; then
+              echo "Found outdated path in: $file"
 
-      - name: Package build results
-        shell: bash
-        run: |
-          cd build-output
-          zip -r ../Nintendo-Build.zip .
+              sed -i \
+                's|/opt/devkitpro/libctru/base_tools|/opt/devkitpro/devkitARM/base_rules|g' \
+                "$file"
+            fi
+          done < <(
+            find . -type f \
+              \( -iname 'Makefile' -o -iname 'makefile' \) \
+              -print0
+          )
 
-      - name: Upload compiled files
-        uses: actions/upload-artifact@v4
-        with:
-          name: Nintendo-Build
-          path: Nintendo-Build.zip
-          if-no-files-found: error
-          retention-days: 14
+          echo "Checking the Makefile..."
+
+          grep -R -n -F \
+            '/opt/devkitpro/libctru/base_tools' \
+            --include='Makefile' \
+            --include='makefile' \
+            . && {
+              echo "::error::The outdated path still exists."
+              exit 1
+            } || true
