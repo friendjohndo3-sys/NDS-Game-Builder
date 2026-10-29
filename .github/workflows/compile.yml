@@ -1,4 +1,3 @@
-```yaml
 name: Nintendo DS and 3DS Builder
 
 on:
@@ -75,4 +74,3 @@ jobs:
           name: nintendo-${{ inputs.platform }}-build
           path: build-output/
           if-no-files-found: error
-```
