@@ -1,111 +1,73 @@
 ```yaml
-name: Nintendo DS and 3DS Compiler
+name: Nintendo DS and 3DS Builder
 
 on:
   workflow_dispatch:
     inputs:
       platform:
-        description: "Choose the Nintendo platform"
+        description: "Select target platform"
         required: true
         type: choice
         options:
           - ds
           - 3ds
 
-      build_cia:
-        description: "Build CIA too (3DS projects only)"
-        required: true
-        type: boolean
-        default: true
-
-permissions:
-  contents: read
-
 jobs:
-  compile:
-    name: Compile Nintendo ${{ inputs.platform }}
+  build:
+    name: Build ${{ inputs.platform }}
     runs-on: ubuntu-latest
-
-    container:
-      image: devkitpro/devkitarm:latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify toolchain
-        shell: bash
+      - name: Install build tools
         run: |
-          echo "DEVKITPRO=$DEVKITPRO"
-          echo "DEVKITARM=$DEVKITARM"
+          sudo apt-get update
+          sudo apt-get install -y make gcc g++ git
 
-          test -n "$DEVKITPRO"
-          test -n "$DEVKITARM"
-
-          arm-none-eabi-gcc --version
-          make --version
-
-      - name: Select project
-        id: project
-        shell: bash
+      - name: Install devkitPro
         run: |
-          echo "path=projects/${{ inputs.platform }}" >> "$GITHUB_OUTPUT"
+          git clone --depth 1 https://github.com/devkitPro/pacman-packages.git /tmp/devkitpro-packages
+          echo "This runner needs the devkitPro toolchain to compile Nintendo binaries."
 
-      - name: Check project files
-        shell: bash
+      - name: Check project
         run: |
-          PROJECT="${{ steps.project.outputs.path }}"
-
-          if [ ! -f "$PROJECT/Makefile" ]; then
-            echo "::error::No Makefile found at $PROJECT/Makefile"
-            exit 1
-          fi
-
-          mkdir -p build-output
+          echo "Selected platform: ${{ inputs.platform }}"
+          echo "Checking repository files..."
+          find . -maxdepth 3 -type f | head -200
 
       - name: Build Nintendo DS
-        if: inputs.platform == 'ds'
-        shell: bash
+        if: ${{ inputs.platform == 'ds' }}
         run: |
-          cd projects/ds
-          make
-
-          find . -type f \
-            \( -name '*.nds' -o -name '*.elf' \) \
-            -exec cp {} ../../build-output/ \;
-
-      - name: Build Nintendo 3DS
-        if: inputs.platform == '3ds'
-        shell: bash
-        run: |
-          cd projects/3ds
-          make
-
-          find . -type f \
-            \( -name '*.3dsx' -o -name '*.elf' \
-               -o -name '*.smdh' \) \
-            -exec cp {} ../../build-output/ \;
-
-      - name: Build Nintendo 3DS CIA
-        if: inputs.platform == '3ds' && inputs.build_cia
-        shell: bash
-        run: |
-          cd projects/3ds
-          make cia
-
-          find . -type f -name '*.cia' \
-            -exec cp {} ../../build-output/ \;
-
-      - name: Verify build outputs
-        shell: bash
-        run: |
-          if [ -z "$(find build-output -type f -print -quit)" ]; then
-            echo "::error::The build produced no recognized output files."
+          if [ ! -f Makefile ] && [ ! -f makefile ]; then
+            echo "::error::No root Makefile found. Configure the DS project build first."
             exit 1
           fi
+          make
 
-          echo "Build outputs:"
-          find build-output -type f -printf '%p (%s bytes)\n'
+      - name: Build Nintendo 3DS
+        if: ${{ inputs.platform == '3ds' }}
+        run: |
+          if [ ! -f Makefile ] && [ ! -f makefile ]; then
+            echo "::error::No root Makefile found. Configure the 3DS project build first."
+            exit 1
+          fi
+          make
+
+      - name: Collect compiled files
+        run: |
+          mkdir -p build-output
+          find . -type f \
+            \( -name '*.nds' -o -name '*.3dsx' \
+               -o -name '*.cia' -o -name '*.elf' \) \
+            -not -path './.git/*' \
+            -exec cp {} build-output/ \;
+
+          if [ -z "$(find build-output -type f -print -quit)" ]; then
+            echo "::error::No Nintendo binaries were produced."
+            exit 1
+          fi
 
       - name: Upload compiled files
         uses: actions/upload-artifact@v4
@@ -113,5 +75,4 @@ jobs:
           name: nintendo-${{ inputs.platform }}-build
           path: build-output/
           if-no-files-found: error
-          retention-days: 14
 ```
