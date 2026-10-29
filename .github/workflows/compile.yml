@@ -1,34 +1,168 @@
-      - name: Fix outdated 3DS Makefile paths
-        if: steps.detect.outputs.target == '3ds'
-        shell: bash
+
+name: 3DS Source ZIP Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_zip:
+        description: "Repository-relative path to the uploaded source ZIP"
+        required: true
+        type: string
+        default: "uploads/source.zip"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Install ZIP utilities
+        run: sudo apt-get update && sudo apt-get install -y unzip zip
+
+      - name: Validate source ZIP
+        env:
+          SOURCE_ZIP: ${{ inputs.source_zip }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          p = Path(os.environ["SOURCE_ZIP"])
+          if p.is_absolute() or ".." in p.parts:
+              raise SystemExit("Invalid ZIP path")
+          if not p.is_file() or p.suffix.lower() != ".zip":
+              raise SystemExit("Source ZIP not found")
+          if p.stat().st_size > 100 * 1024 * 1024:
+              raise SystemExit("ZIP exceeds 100 MB limit")
+          print("Source ZIP validated")
+          PY
+
+      - name: Install 3DS toolchain
+        run: |
+          wget -q https://apt.devkitpro.org/install-devkitpro-pacman
+          chmod +x install-devkitpro-pacman
+          sudo ./install-devkitpro-pacman
+          sudo dkp-pacman -Syu --noconfirm
+          sudo dkp-pacman -S --needed --noconfirm \
+            3ds-dev 3ds-libctru 3ds-tools
+
+      - name: Extract source ZIP safely
+        env:
+          SOURCE_ZIP: ${{ inputs.source_zip }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/source" dist
+          python3 - <<'PY'
+          import os, zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(os.environ["SOURCE_ZIP"])
+          target = Path(os.environ["RUNNER_TEMP"]) / "source"
+          max_total = 500 * 1024 * 1024
+          total = 0
+
+          with zipfile.ZipFile(archive) as z:
+              for item in z.infolist():
+                  name = item.filename
+                  p = PurePosixPath(name)
+                  mode = item.external_attr >> 16
+
+                  if (p.is_absolute() or ".." in p.parts
+                      or "\\" in name or "\x00" in name):
+                      raise SystemExit(f"Unsafe ZIP path: {name}")
+                  if mode & 0o170000 == 0o120000:
+                      raise SystemExit("Symbolic links are not allowed")
+                  if item.flag_bits & 1:
+                      raise SystemExit("Encrypted ZIP entries are unsupported")
+                  if item.file_size > max_total:
+                      raise SystemExit("File too large")
+                  total += item.file_size
+                  if total > max_total:
+                      raise SystemExit("Extracted ZIP exceeds 500 MB")
+                  if item.is_dir():
+                      (target / Path(*p.parts)).mkdir(
+                          parents=True, exist_ok=True)
+                  else:
+                      dest = target / Path(*p.parts)
+                      dest.parent.mkdir(parents=True, exist_ok=True)
+                      with z.open(item) as src, dest.open("wb") as out:
+                          while True:
+                              chunk = src.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              out.write(chunk)
+
+          print("Extraction complete")
+          PY
+
+      - name: Locate Makefile
+        id: project
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "source"
+          files = list(root.rglob("Makefile"))
+          files = [
+              p for p in files
+              if not any(x.startswith(".") for x in p.relative_to(root).parts)
+          ]
+          if len(files) != 1:
+              raise SystemExit(
+                  f"Expected exactly one Makefile, found {len(files)}. "
+                  "Place one buildable project in the ZIP."
+              )
+          p = files[0].parent
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"project_dir={p}\n")
+          print(f"Project: {p}")
+          PY
+
+      - name: Compile 3DS project
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
         run: |
           set -euo pipefail
+          source /etc/profile.d/devkit-env.sh
+          cd "$PROJECT_DIR"
+          make -j2
 
-          cd /tmp/nintendo-project
+      - name: Collect build outputs
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
+        run: |
+          python3 - <<'PY'
+          import os, shutil
+          from pathlib import Path
 
-          echo "Searching Makefiles for outdated devkitPro paths..."
+          root = Path(os.environ["PROJECT_DIR"])
+          out = Path("dist")
+          allowed = {".3dsx", ".cia", ".3ds", ".smdh", ".elf"}
 
-          while IFS= read -r -d '' file; do
-            if grep -qF '/opt/devkitpro/libctru/base_tools' "$file"; then
-              echo "Found outdated path in: $file"
+          for p in root.rglob("*"):
+              if p.is_file() and p.suffix.lower() in allowed:
+                  if any(part in {".git", ".github"} for part in p.parts):
+                      continue
+                  dest = out / p.name
+                  if dest.exists():
+                      raise SystemExit(f"Duplicate output filename: {p.name}")
+                  shutil.copy2(p, dest)
 
-              sed -i \
-                's|/opt/devkitpro/libctru/base_tools|/opt/devkitpro/devkitARM/base_rules|g' \
-                "$file"
-            fi
-          done < <(
-            find . -type f \
-              \( -iname 'Makefile' -o -iname 'makefile' \) \
-              -print0
-          )
+          if not any(p.is_file() for p in out.iterdir()):
+              raise SystemExit("Build finished but no supported output was found")
+          print("Collected outputs:")
+          for p in out.iterdir():
+              print(p.name, p.stat().st_size, "bytes")
+          PY
 
-          echo "Checking the Makefile..."
-
-          grep -R -n -F \
-            '/opt/devkitpro/libctru/base_tools' \
-            --include='Makefile' \
-            --include='makefile' \
-            . && {
-              echo "::error::The outdated path still exists."
-              exit 1
-            } || true
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3ds-build
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
